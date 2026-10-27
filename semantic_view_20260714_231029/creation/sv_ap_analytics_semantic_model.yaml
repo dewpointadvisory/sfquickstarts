@@ -1,0 +1,178 @@
+name: SV_AP_ANALYTICS
+description: >
+  Accounts Payable invoice analytics across four ERP source systems (SAP,
+  Oracle, Baan, Workday). Supports spend analysis by vendor, time trending,
+  overdue invoice tracking, and approval status monitoring. Grain: one row
+  per invoice line. Amounts are in original transaction currency (not converted).
+tables:
+  - name: SILVER_AP_INVOICES
+    base_table:
+      database: COCO_WORKSHOP
+      schema: PIPELINE_LAB
+      table: SILVER_AP_INVOICES
+    dimensions:
+      - name: INVOICE_ID
+        expr: INVOICE_ID
+        data_type: VARCHAR
+        description: Unique invoice identifier from the source system. Format varies by source (SAP-NNN, ORA-NNN, BAN-NNN, WD-NNN).
+      - name: INVOICE_NUMBER
+        expr: INVOICE_NUMBER
+        data_type: VARCHAR
+        description: Business-facing invoice number used for deduplication and human reference.
+      - name: VENDOR_ID
+        expr: VENDOR_ID
+        data_type: VARCHAR
+        description: Source-system vendor/supplier identifier. Not deduplicated across systems — the same real-world vendor may have different IDs in SAP vs Oracle.
+      - name: VENDOR_NAME
+        expr: VENDOR_NAME
+        data_type: VARCHAR
+        description: Business name of the vendor or supplier. Use for grouping spend by vendor.
+        synonyms:
+          - supplier
+          - supplier name
+          - vendor
+      - name: CURRENCY_CODE
+        expr: CURRENCY_CODE
+        data_type: VARCHAR
+        description: ISO 4217 currency code (USD, EUR, GBP). Amounts are NOT converted — each row is in its original transaction currency. Do not sum across currencies without explicit user intent.
+        synonyms:
+          - currency
+      - name: PAYMENT_TERMS
+        expr: PAYMENT_TERMS
+        data_type: VARCHAR
+        description: Raw payment terms from source system. Format varies (NET30, N30, Net 30 are equivalent but not normalized at this layer).
+      - name: PO_NUMBER
+        expr: PO_NUMBER
+        data_type: VARCHAR
+        description: Purchase order reference. May be NULL for service invoices without a PO.
+        synonyms:
+          - purchase order
+      - name: LINE_DESCRIPTION
+        expr: LINE_DESCRIPTION
+        data_type: VARCHAR
+        description: Free-text description of the invoice line item or memo.
+      - name: GL_ACCOUNT
+        expr: GL_ACCOUNT
+        data_type: VARCHAR
+        description: General ledger account code in source-native format. Not cross-mapped — each source uses its own chart of accounts numbering.
+        synonyms:
+          - account
+          - ledger account
+      - name: COST_CENTER
+        expr: COST_CENTER
+        data_type: VARCHAR
+        description: Organizational cost center or department charged. Format varies by source (CC-ENG-01, D-ENG, BC-MFG, WCC-TECH).
+        synonyms:
+          - department
+          - business unit
+          - dept
+      - name: APPROVAL_STATUS
+        expr: APPROVAL_STATUS
+        data_type: VARCHAR
+        description: "Normalized invoice status: APPROVED (ready to pay) or PENDING (awaiting approval). Derived from source-specific statuses via business rule BR-001."
+        synonyms:
+          - status
+      - name: SOURCE_SYSTEM
+        expr: SOURCE_SYSTEM
+        data_type: VARCHAR
+        description: "Originating ERP system: SAP, ORACLE, BAAN, or WORKDAY. Use for data completeness checks and source-level filtering."
+        synonyms:
+          - source
+          - system
+          - ERP
+    time_dimensions:
+      - name: INVOICE_DATE
+        expr: INVOICE_DATE
+        data_type: DATE
+        description: The date the invoice was issued. Primary time dimension for trending analysis. Use DATE_TRUNC to month or quarter for aggregation.
+        synonyms:
+          - invoice month
+          - invoice period
+      - name: DUE_DATE
+        expr: DUE_DATE
+        data_type: DATE
+        description: The date payment is expected. Compare to CURRENT_DATE() to identify overdue invoices. An invoice is overdue when DUE_DATE < CURRENT_DATE() and APPROVAL_STATUS = 'APPROVED'.
+        synonyms:
+          - payment due date
+      - name: CREATED_AT
+        expr: CREATED_AT
+        data_type: TIMESTAMP_NTZ
+        description: Timestamp when the invoice record was created in the source system (UTC).
+    facts:
+      - name: INVOICE_AMOUNT
+        expr: INVOICE_AMOUNT
+        data_type: NUMBER
+        description: The original transaction amount in the source currency. Always positive for standard invoices; credit memos may appear as negative amounts (Baan only). Do not sum across currencies without explicit user intent.
+        synonyms:
+          - amount
+          - spend
+          - invoice value
+          - total
+    filters:
+      - name: OVERDUE_INVOICES
+        expr: DUE_DATE < CURRENT_DATE() AND APPROVAL_STATUS = 'APPROVED'
+        description: Invoices that are past due date and approved for payment but not yet paid.
+        synonyms:
+          - overdue
+          - past due
+          - unpaid
+      - name: PENDING_APPROVAL
+        expr: APPROVAL_STATUS = 'PENDING'
+        description: Invoices awaiting approval.
+        synonyms:
+          - pending
+          - unapproved
+          - in review
+verified_queries:
+  - name: total_spend_by_vendor_12m
+    question: What is the total AP spend by vendor over the last 12 months?
+    sql: >
+      SELECT VENDOR_NAME, SUM(INVOICE_AMOUNT) AS TOTAL_SPEND
+      FROM SILVER_AP_INVOICES
+      WHERE INVOICE_DATE >= DATEADD(MONTH, -12, CURRENT_DATE())
+      GROUP BY VENDOR_NAME
+      ORDER BY TOTAL_SPEND DESC
+    verified_at: 1784063469
+    verified_by: Semantic Model Generator
+  - name: invoice_count_by_month_and_cost_center
+    question: What is the monthly invoice count by business unit?
+    sql: >
+      SELECT DATE_TRUNC('MONTH', INVOICE_DATE) AS INVOICE_MONTH, COST_CENTER,
+      COUNT(*) AS INVOICE_COUNT
+      FROM SILVER_AP_INVOICES
+      GROUP BY INVOICE_MONTH, COST_CENTER
+      ORDER BY INVOICE_MONTH
+    verified_at: 1784063469
+    verified_by: Semantic Model Generator
+  - name: top_10_vendors_unpaid
+    question: Which are the top 10 vendors by unpaid overdue invoice amount?
+    sql: >
+      SELECT VENDOR_NAME, SUM(INVOICE_AMOUNT) AS UNPAID_AMOUNT,
+      COUNT(*) AS INVOICE_COUNT
+      FROM SILVER_AP_INVOICES
+      WHERE DUE_DATE < CURRENT_DATE() AND APPROVAL_STATUS = 'APPROVED'
+      GROUP BY VENDOR_NAME
+      ORDER BY UNPAID_AMOUNT DESC
+      LIMIT 10
+    verified_at: 1784063469
+    verified_by: Semantic Model Generator
+  - name: invoice_count_by_source_system
+    question: Which source system has the most invoices?
+    sql: >
+      SELECT SOURCE_SYSTEM, COUNT(*) AS INVOICE_COUNT,
+      SUM(INVOICE_AMOUNT) AS TOTAL_AMOUNT
+      FROM SILVER_AP_INVOICES
+      GROUP BY SOURCE_SYSTEM
+      ORDER BY INVOICE_COUNT DESC
+    verified_at: 1784063469
+    verified_by: Semantic Model Generator
+  - name: breakdown_by_approval_status
+    question: What is the invoice count and total amount by approval status?
+    sql: >
+      SELECT APPROVAL_STATUS, COUNT(*) AS INVOICE_COUNT,
+      SUM(INVOICE_AMOUNT) AS TOTAL_AMOUNT
+      FROM SILVER_AP_INVOICES
+      GROUP BY APPROVAL_STATUS
+      ORDER BY INVOICE_COUNT DESC
+    verified_at: 1784063469
+    verified_by: Semantic Model Generator
